@@ -3,6 +3,7 @@
 #include "mtmd-helper-common.h"
 #include "llama.h"
 #include "../src/llama-ext.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -993,8 +994,285 @@ private:
     std::vector<char> out_buf;
 };
 
+// The converter serializes Python's Unicode normalization tables alongside the
+// multilingual vocabulary, avoiding a platform-specific Unicode dependency.
+class chatterbox_text_normalizer {
+public:
+    bool load(const llama_model * model) {
+        const char * key = "llama.tts.normalization";
+        int length = llama_model_meta_val_str(model, key, nullptr, 0);
+        if (length <= 0) { return false; }
+        std::vector<char> data((size_t) length + 1);
+        if (llama_model_meta_val_str(model, key, data.data(), data.size()) != length) { return false; }
+        try {
+            auto json = nlohmann::json::parse(data.data());
+            mapping = json.at("map").get<std::unordered_map<std::string, std::string>>();
+            combining = json.at("ccc").get<std::unordered_map<std::string, int>>();
+            casing = json.at("case").get<std::unordered_map<std::string, int>>();
+            cangjie = json.at("cangjie").get<std::unordered_map<std::string, std::string>>();
+        } catch (const std::exception & e) {
+            LOG_ERR("mtmd_helper_gen_audio: invalid Chatterbox normalization tables: %s\n", e.what());
+            return false;
+        }
+        return true;
+    }
+    bool normalize(std::string & text, bool chinese) const {
+        std::vector<std::string> chars;
+        if (!split(text, chars)) { return false; }
+        std::vector<std::pair<std::string, int>> normalized;
+        for (size_t i = 0; i < chars.size(); ++i) {
+            auto it = mapping.find(chars[i]);
+            std::string replacement = it == mapping.end() ? chars[i] : it->second;
+            // Unicode Default Case Conversion's context-sensitive final sigma.
+            if (chars[i] == "Σ") {
+                bool before = false, after = false;
+                for (size_t j = i; j > 0;) {
+                    int f = flags(chars[--j]); if (f & 2) { continue; } before = f & 1; break;
+                }
+                for (size_t j = i + 1; j < chars.size(); ++j) {
+                    int f = flags(chars[j]); if (f & 2) { continue; } after = f & 1; break;
+                }
+                if (before && !after) { replacement = "ς"; }
+            }
+            std::vector<std::string> decomposed;
+            if (!split(replacement, decomposed)) { return false; }
+            for (const auto & c : decomposed) {
+                auto cc = combining.find(c);
+                const int order = cc == combining.end() ? 0 : cc->second;
+                normalized.emplace_back(c, order);
+                if (order) {
+                    size_t k = normalized.size() - 1;
+                    while (k && normalized[k - 1].second > order) {
+                        std::swap(normalized[k], normalized[k - 1]); --k;
+                    }
+                }
+            }
+        }
+        text.clear();
+        for (const auto & item : normalized) {
+            auto it = chinese ? cangjie.find(item.first) : cangjie.end();
+            text += it == cangjie.end() ? item.first : it->second;
+        }
+        return true;
+    }
+private:
+    static bool split(const std::string & text, std::vector<std::string> & out) {
+        for (size_t i = 0; i < text.size();) {
+            unsigned char lead = text[i];
+            int length = lead < 0x80 ? 1 : lead >= 0xC2 && lead < 0xE0 ? 2 : lead < 0xF0 && lead >= 0xE0 ? 3 : lead <= 0xF4 && lead >= 0xF0 ? 4 : 0;
+            if (!length || i + length > text.size()) { return false; }
+            for (int j = 1; j < length; ++j) { if (((unsigned char) text[i + j] & 0xC0) != 0x80) { return false; } }
+            if (length >= 3) {
+                unsigned char second = text[i + 1];
+                if ((lead == 0xE0 && second < 0xA0) || (lead == 0xED && second >= 0xA0) ||
+                    (lead == 0xF0 && second < 0x90) || (lead == 0xF4 && second >= 0x90)) { return false; }
+            }
+            out.emplace_back(text.substr(i, length)); i += length;
+        }
+        return true;
+    }
+    int flags(const std::string & c) const { auto it = casing.find(c); return it == casing.end() ? 0 : it->second; }
+    std::unordered_map<std::string, std::string> mapping, cangjie;
+    std::unordered_map<std::string, int> combining, casing;
+};
+
+// Chatterbox T3 produces one S3 code per step. Its non-Turbo variants use
+// classifier-free guidance with an independent cache for the text-free lane.
+class chatterbox_gen_audio_pipeline : public mtmd_gen_audio_pipeline {
+public:
+    using mtmd_gen_audio_pipeline::mtmd_gen_audio_pipeline;
+    ~chatterbox_gen_audio_pipeline() override { if (negative_ctx) { llama_free(negative_ctx); } }
+
+    void reset() override {
+        prompt.clear(); negative_prompt.clear(); codes.clear(); next.clear(); out_buf.clear(); reference_state.clear();
+        prompt_pos = 0; pos = 0; audio_ready = false;
+        if (negative_ctx) { llama_memory_clear(llama_get_memory(negative_ctx), false); }
+    }
+
+    int32_t set_input(const mtmd_helper_gen_audio_inp * inp) override {
+        reset();
+        seq_id = inp->seq_id; seed = inp->seed; out_type = inp->out_type;
+        turbo = std::string(info.model_variant).find("turbo") != std::string::npos;
+        n_text = llama_vocab_n_tokens(vocab) - (turbo ? 6563 : 8194);
+        if (n_text != 704 && n_text != 2454 && n_text != 50276) { return 1; }
+        llama_set_embeddings(lctx, false);
+        llama_memory_seq_rm(llama_get_memory(lctx), seq_id, -1, -1);
+        if (!turbo && !negative_ctx) {
+            auto cp = llama_context_default_params();
+            cp.n_ctx = llama_n_ctx(lctx); cp.n_batch = llama_n_batch(lctx); cp.n_ubatch = llama_n_ubatch(lctx);
+            cp.n_threads = llama_n_threads(lctx); cp.n_threads_batch = llama_n_threads_batch(lctx);
+            negative_ctx = llama_init_from_model(const_cast<llama_model *>(model), cp);
+            if (!negative_ctx) { return 1; }
+        }
+        std::string text(inp->prompt, inp->prompt_len);
+        if (text.empty()) { return 1; }
+        normalize_punctuation(text);
+        if (n_text == 2454) {
+            std::string lang = inp->lang && *inp->lang ? inp->lang : "en";
+            static const std::vector<std::string> languages = {
+                "ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi", "it", "ja",
+                "ko", "ms", "nl", "no", "pl", "pt", "ru", "sv", "sw", "tr", "zh"};
+            if (std::find(languages.begin(), languages.end(), lang) == languages.end()) {
+                LOG_ERR("mtmd_helper_gen_audio: unsupported Chatterbox language %s\n", lang.c_str());
+                return 1;
+            }
+            if (!normalizer) {
+                normalizer.reset(new chatterbox_text_normalizer());
+                if (!normalizer->load(model)) { normalizer.reset(); return 1; }
+            }
+            if (!normalizer->normalize(text, lang == "zh")) { return 1; }
+            text = "[" + lang + "]" + text;
+        } else if (inp->lang && *inp->lang && std::string(inp->lang) != "en") {
+            LOG_ERR("mtmd_helper_gen_audio: this Chatterbox checkpoint supports English\n");
+            return 1;
+        }
+        if (!turbo) { replace(text, " ", "[SPACE]"); }
+        int n = -llama_tokenize(vocab, text.data(), text.size(), nullptr, 0, false, true);
+        if (n <= 0) { return 1; }
+        std::vector<llama_token> tokens(n);
+        if (llama_tokenize(vocab, text.data(), text.size(), tokens.data(), n, false, true) != n) { return 1; }
+        if (!turbo) { tokens.insert(tokens.begin(), 255); tokens.push_back(0); }
+        auto request = mtmd_gen_inp_default(mctx);
+        request.type = MTMD_GEN_PROCESS_TYPE_GEN_PROMPT;
+        request.tokens = tokens.data(); request.n_tokens = tokens.size(); request.speaker_ref = inp->speaker_ref;
+        mtmd_gen_out result{};
+        if (mtmd_gen_audio_process(mctx, &request, &result)) { return 1; }
+        size_t count = result.n_embd / (turbo ? 1 : 2);
+        if (count == 0 || count % n_embd) { return 1; }
+        if (result.state_size) { reference_state.assign(result.state_data, result.state_data + result.state_size); }
+        prompt.assign(result.embd, result.embd + count);
+        if (!turbo) { negative_prompt.assign(result.embd + count, result.embd + result.n_embd); }
+        if (count / n_embd + 1 >= llama_n_ctx(lctx)) {
+            LOG_ERR("mtmd_helper_gen_audio: Chatterbox prompt exceeds context\n"); return 1;
+        }
+        return 0;
+    }
+
+    int32_t step_prompt(int32_t n_batch) override {
+        const int total = prompt.size() / n_embd;
+        if (prompt_pos == total) { return 0; }
+        const int count = std::min(n_batch, total - prompt_pos);
+        const bool last = prompt_pos + count == total;
+        if (!decode(lctx, prompt.data() + (size_t) prompt_pos * n_embd, count, prompt_pos, seq_id, last)) { return -1; }
+        if (!turbo && !decode(negative_ctx, negative_prompt.data() + (size_t) prompt_pos * n_embd, count, prompt_pos, 0, last)) { return -1; }
+        prompt_pos += count; pos = prompt_pos;
+        if (last) { prepare_logits(); }
+        return total - prompt_pos;
+    }
+
+    int32_t step_gen(llama_token sampled, const float *, const float ** h_state_out, bool * out_stop) override {
+        *h_state_out = nullptr; *out_stop = false;
+        const int code = sampled - n_text;
+        if (code == 6562) { *out_stop = true; return 0; }
+        if (code < 0 || code >= 6561) { return 1; }
+        codes.push_back(code);
+        if (pos >= (int) llama_n_ctx(lctx) || codes.size() >= (turbo ? 4093u : 4096u)) { *out_stop = true; return 0; }
+        auto request = mtmd_gen_inp_default(mctx);
+        request.type = MTMD_GEN_PROCESS_TYPE_GEN_CODE;
+        request.code0 = code; request.position = codes.size();
+        mtmd_gen_out result{};
+        if (mtmd_gen_audio_process(mctx, &request, &result) || result.n_embd != (size_t) n_embd) { return 1; }
+        next.assign(result.embd, result.embd + result.n_embd);
+        if (!decode(lctx, next.data(), 1, pos, seq_id, true)) { return 1; }
+        if (!turbo && !decode(negative_ctx, next.data(), 1, pos, 0, true)) { return 1; }
+        ++pos;
+        prepare_logits();
+        *h_state_out = next.data();
+        return 0;
+    }
+
+    int32_t get_output(int32_t * rate, const char ** data, size_t * size, int64_t * samples) override {
+        if (!audio_ready) {
+            if (codes.empty()) { return 1; }
+            auto request = mtmd_gen_inp_default(mctx);
+            request.type = MTMD_GEN_PROCESS_TYPE_GEN_WAV;
+            std::vector<int32_t> waveform_codes = codes;
+            if (turbo) { waveform_codes.insert(waveform_codes.end(), 3, 4299); }
+            request.codes = waveform_codes.data(); request.n_codes = waveform_codes.size(); request.seed = seed;
+            request.state_data = reference_state.empty() ? nullptr : reference_state.data(); request.state_size = reference_state.size();
+            mtmd_gen_out result{};
+            if (mtmd_gen_audio_process(mctx, &request, &result)) { return 1; }
+            n_samples = result.n_samples;
+            // Multilingual drops the last token's noisy 40 ms, as in the reference pipeline.
+            if (n_text == 2454 && n_samples > 960) { n_samples -= 960; }
+            if (out_type == MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV) {
+                std::vector<float> pcm(result.audio, result.audio + n_samples);
+                if (!write_wav16(out_buf, pcm, 24000)) { return 1; }
+            } else {
+                const char * begin = reinterpret_cast<const char *>(result.audio);
+                out_buf.assign(begin, begin + n_samples * sizeof(float));
+            }
+            audio_ready = true;
+        }
+        *rate = 24000; *data = out_buf.data(); *size = out_buf.size(); *samples = n_samples;
+        return 0;
+    }
+
+private:
+    static void replace(std::string & s, const std::string & from, const std::string & to) {
+        size_t p = 0;
+        while ((p = s.find(from, p)) != std::string::npos) { s.replace(p, from.size(), to); p += to.size(); }
+    }
+    void normalize_punctuation(std::string & text) {
+        if ((unsigned char) text[0] < 128) { text[0] = (char) std::toupper((unsigned char) text[0]); }
+        for (const std::string & ws : {"", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", "　"}) {
+            replace(text, ws, " ");
+        }
+        std::string collapsed;
+        bool space = false;
+        for (unsigned char c : text) {
+            if (c < 128 && (std::isspace(c) || (c >= 0x1C && c <= 0x1F))) { space = !collapsed.empty(); }
+            else { if (space) { collapsed += ' '; } collapsed += (char) c; space = false; }
+        }
+        text = collapsed;
+        if (!turbo) { replace(text, "...", ", "); }
+        replace(text, "…", ", "); replace(text, ":", ",");
+        if (!turbo) { replace(text, " - ", ", "); replace(text, ";", ", "); }
+        for (const auto & pair : std::vector<std::pair<std::string, std::string>>{
+                {"—", "-"}, {"–", "-"}, {" ,", ","}, {"“", "\""}, {"”", "\""}, {"‘", "'"}, {"’", "'"}}) {
+            replace(text, pair.first, pair.second);
+        }
+        while (!text.empty() && text.back() == ' ') { text.pop_back(); }
+        bool ends = !text.empty() && std::string(".!?-,").find(text.back()) != std::string::npos;
+        if (n_text == 2454) {
+            for (const std::string & mark : {"、", "，", "。", "？", "！"}) {
+                if (text.size() >= mark.size() && text.compare(text.size() - mark.size(), mark.size(), mark) == 0) { ends = true; }
+            }
+        }
+        if (!text.empty() && !ends) { text += '.'; }
+    }
+    bool decode(llama_context * ctx, float * embd, int count, int position, llama_seq_id sequence, bool last) {
+        decode_embd_batch batch(embd, count, 1, n_embd);
+        batch.set_position_normal(position, sequence);
+        batch.batch.logits[count - 1] = last;
+        return llama_decode(ctx, batch.batch) == 0;
+    }
+    void prepare_logits() {
+        float * logits = llama_get_logits_ith(lctx, -1);
+        const float * negative = turbo ? nullptr : llama_get_logits_ith(negative_ctx, -1);
+        for (int i = 0; i < llama_vocab_n_tokens(vocab); ++i) {
+            const int code = i - n_text;
+            if (code < 0 || code == 6561 || code > 6562) { logits[i] = -INFINITY; }
+            else if (negative) { logits[i] += 0.5f * (logits[i] - negative[i]); }
+        }
+    }
+    std::unique_ptr<chatterbox_text_normalizer> normalizer;
+    llama_context * negative_ctx = nullptr;
+    llama_seq_id seq_id = 0;
+    bool turbo = false, audio_ready = false;
+    int n_text = 0, prompt_pos = 0, pos = 0;
+    uint32_t seed = UINT32_MAX;
+    int64_t n_samples = 0;
+    std::vector<float> prompt, negative_prompt, next;
+    std::vector<int32_t> codes;
+    std::vector<char> out_buf, reference_state;
+    mtmd_helper_gen_audio_outtype out_type = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+};
+
 static std::unique_ptr<mtmd_gen_audio_pipeline> make_pipeline(llama_context * lctx, mtmd_context * mctx) {
     switch (mtmd_gen_audio_get_info(mctx).type) {
+        case MTMD_GEN_AUDIO_TYPE_CHATTERBOX:
+            return std::unique_ptr<mtmd_gen_audio_pipeline>(new chatterbox_gen_audio_pipeline(lctx, mctx));
         case MTMD_GEN_AUDIO_TYPE_QWEN3TTS:
             return std::unique_ptr<mtmd_gen_audio_pipeline>(new qwen3tts_gen_audio_pipeline(lctx, mctx));
         case MTMD_GEN_AUDIO_TYPE_POCKETTTS:

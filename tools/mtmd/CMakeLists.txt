@@ -28,6 +28,7 @@ add_library(mtmd
             clip-model.h
             clip-graph.h
             models/models.h
+            models/chatterbox-gen.cpp
             models/cogvlm.cpp
             models/conformer.cpp
             models/deepseek4v.cpp
@@ -81,7 +82,7 @@ set_target_properties(mtmd PROPERTIES
 )
 
 target_link_libraries     (mtmd PUBLIC ggml llama)
-target_link_libraries     (mtmd PRIVATE Threads::Threads vendor::hash vendor::miniaudio vendor::stb vendor::sheredom)
+target_link_libraries     (mtmd PRIVATE Threads::Threads vendor::nlohmann vendor::hash vendor::miniaudio vendor::stb vendor::sheredom)
 target_include_directories(mtmd PUBLIC  .)
 target_compile_features   (mtmd PRIVATE cxx_std_17)
 

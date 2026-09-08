@@ -545,6 +545,10 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                     "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}+| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
                 };
                 break;
+            case LLAMA_VOCAB_PRE_TYPE_CHATTERBOX:
+                regex_exprs = {"[\\p{L}\\p{N}\\p{M}_]+|[^\\p{L}\\p{N}\\p{M}_\\s]+"};
+                byte_encode = false;
+                break;
             case LLAMA_VOCAB_PRE_TYPE_WHITESPACE:
                 // whitespace pre-tokenizer (jinaai/jina-embeddings-v2-base-zh)
                 regex_exprs = {
@@ -618,6 +622,12 @@ struct llm_tokenizer_bpe_session {
         auto tok_pre = vocab.get_pre_type();
 
         for (const auto & word : word_collection) {
+            if (tok_pre == LLAMA_VOCAB_PRE_TYPE_CHATTERBOX) {
+                const auto cpts = unicode_cpts_from_utf8(word);
+                if (std::all_of(cpts.begin(), cpts.end(), [](uint32_t c) { return unicode_cpt_flags_from_cpt(c).is_whitespace; })) {
+                    continue;
+                }
+            }
             work_queue = llm_bigram_bpe::queue();
             symbols.clear();
 
@@ -709,6 +719,10 @@ struct llm_tokenizer_bpe_session {
                 const auto token = vocab.text_to_token(str);
 
                 if (token == LLAMA_TOKEN_NULL) {
+                    if (vocab.get_pre_type() == LLAMA_VOCAB_PRE_TYPE_CHATTERBOX) {
+                        output.push_back(vocab.token_unk());
+                        continue;
+                    }
                     for (auto j = str.begin(); j != str.end(); ++j) {
                         llama_token token_multibyte = LLAMA_TOKEN_NULL;
                         if (tokenizer.byte_encode) {
@@ -2229,6 +2243,9 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_GPT2;
                 add_sep = true;
             } else if (
+                    tokenizer_pre == "chatterbox") {
+                pre_type = LLAMA_VOCAB_PRE_TYPE_CHATTERBOX;
+            } else if (
                     tokenizer_pre == "whitespace") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_WHITESPACE;
                 normalizer_opts.lowercase = false;
@@ -3662,6 +3679,9 @@ int32_t llama_vocab::impl::token_to_piece(llama_token token, char * buf, int32_t
                         std::string result = token_text;
                         llama_unescape_whitespace(result);
                         return _try_copy(result.data(), result.size());
+                    }
+                    if (pre_type == LLAMA_VOCAB_PRE_TYPE_CHATTERBOX) {
+                        return _try_copy(token_text.data(), token_text.size());
                     }
                     std::string result = llama_decode_text(token_text);
                     return _try_copy(result.data(), result.size());

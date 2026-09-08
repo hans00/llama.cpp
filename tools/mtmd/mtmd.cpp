@@ -583,7 +583,7 @@ struct mtmd_context {
         ctx_v = res.ctx_v;
         ctx_a = res.ctx_a;
         ctx_gen_a = res.ctx_gen_a;
-        if (!ctx_v && !ctx_a) {
+        if (!ctx_v && !ctx_a && !ctx_gen_a) {
             throw std::runtime_error(string_format("Failed to load CLIP model from %s\n", mmproj_fname));
         }
 
@@ -600,7 +600,7 @@ struct mtmd_context {
 
         // since we already validate n_embd of vision and audio mmproj,
         // we can safely assume that they are the same
-        int n_embd_clip = clip_n_mmproj_embd(ctx_v ? ctx_v : ctx_a);
+        int n_embd_clip = clip_n_mmproj_embd(ctx_v ? ctx_v : (ctx_a ? ctx_a : ctx_gen_a));
         if (n_embd_text > 0 && n_embd_text != n_embd_clip) {
             throw std::runtime_error(string_format(
                 "mismatch between text model (n_embd = %d) and mmproj (n_embd = %d)\n"
@@ -614,6 +614,18 @@ struct mtmd_context {
                     "mismatch between text model (n_embd = %d) and gen-audio mmproj (n_embd = %d)\n"
                     "hint: you may be using wrong mmproj\n",
                     n_embd_text, n_embd_gen));
+            }
+        }
+        if (text_model && ctx_gen_a && clip_get_projector_type(ctx_gen_a) == PROJECTOR_TYPE_CHATTERBOX_GEN) {
+            const auto & hp = *clip_get_hparams(ctx_gen_a);
+            char architecture[32] = {}, checkpoint[128] = {};
+            llama_model_meta_val_str(text_model, "general.architecture", architecture, sizeof(architecture));
+            const std::string key = std::string(architecture) + ".tts.checkpoint";
+            const int length = llama_model_meta_val_str(text_model, key.c_str(), checkpoint, sizeof(checkpoint));
+            const int n_speech = hp.chatterbox_meanflow ? 6563 : 8194;
+            if (length <= 0 || length >= (int) sizeof(checkpoint) || hp.gen_model_variant != checkpoint ||
+                    llama_vocab_n_tokens(vocab) != hp.chatterbox_text_vocab + n_speech) {
+                throw std::runtime_error("Chatterbox backbone and mmproj must come from the same checkpoint");
             }
         }
         if (ctx_v) {
@@ -1871,6 +1883,7 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
 mtmd_gen_audio_info mtmd_gen_audio_get_info(const mtmd_context * ctx) {
     mtmd_gen_audio_info info{};
     info.model_variant = "";
+    info.needs_hidden_state = true;
     if (!ctx->ctx_gen_a) {
         info.type = MTMD_GEN_AUDIO_TYPE_NONE;
         return info;
@@ -1879,6 +1892,11 @@ mtmd_gen_audio_info mtmd_gen_audio_get_info(const mtmd_context * ctx) {
     switch (clip_get_projector_type(ctx->ctx_gen_a)) {
         case PROJECTOR_TYPE_QWEN3TTS_GEN:
             info.type = MTMD_GEN_AUDIO_TYPE_QWEN3TTS;
+            info.sample_rate = 24000;
+            break;
+        case PROJECTOR_TYPE_CHATTERBOX_GEN:
+            info.type = MTMD_GEN_AUDIO_TYPE_CHATTERBOX;
+            info.needs_hidden_state = false;
             info.sample_rate = 24000;
             break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
@@ -1927,6 +1945,69 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, const mtmd_gen_in
     }
 
     *out = {};
+    if (inp->type != MTMD_GEN_PROCESS_TYPE_GEN_PROMPT && inp->type != MTMD_GEN_PROCESS_TYPE_GEN_CODE &&
+            inp->type != MTMD_GEN_PROCESS_TYPE_GEN_WAV) {
+        LOG_ERR("%s: invalid audio generation process type\n", __func__);
+        return 1;
+    }
+
+    if (clip_get_projector_type(ctx_clip) == PROJECTOR_TYPE_CHATTERBOX_GEN &&
+            inp->type != MTMD_GEN_PROCESS_TYPE_GEN_WAV) {
+        const auto & hp = *clip_get_hparams(ctx_clip);
+        const bool prompt = inp->type == MTMD_GEN_PROCESS_TYPE_GEN_PROMPT;
+        if (prompt && (!inp->tokens || inp->n_tokens == 0 || inp->n_tokens > 2048)) {
+            LOG_ERR("%s: Chatterbox requires 1..2048 text tokens\n", __func__);
+            return 1;
+        }
+        if (!prompt && (inp->code0 < 0 || inp->code0 >= 6561 || inp->position < 1 || inp->position >= 4100)) {
+            LOG_ERR("%s: invalid Chatterbox speech code or position\n", __func__);
+            return 1;
+        }
+        clip_chatterbox_reference reference;
+        if (prompt && inp->speaker_ref) {
+            const auto * bitmap = inp->speaker_ref;
+            if (!bitmap->is_audio || bitmap->get_ro_buf().size() != (size_t) bitmap->nx * sizeof(float)) { return 1; }
+            std::vector<float> pcm(bitmap->nx);
+            std::memcpy(pcm.data(), bitmap->get_ro_buf().data(), bitmap->get_ro_buf().size());
+            if (!clip_chatterbox_encode_reference(ctx_clip, pcm, ctx->n_threads, reference)) { return 1; }
+        }
+        std::vector<int32_t> tokens;
+        if (prompt) {
+            tokens.assign(inp->tokens, inp->tokens + inp->n_tokens);
+            for (int32_t token : tokens) {
+                if (token < 0 || token >= hp.chatterbox_text_vocab) { return 1; }
+            }
+        }
+        clip_image_f32 dummy;
+        dummy.set_size({1, 1}, false, true);
+        dummy.cpy_buf(std::vector<float>(1));
+        clip_image_f32_batch batch;
+        batch.is_audio = true;
+        batch.entries.push_back(std::move(dummy));
+        clip_encode_params params;
+        params.imgs = &batch;
+        params.n_threads = ctx->n_threads;
+        params.chatterbox.stage = prompt ? clip_chatterbox_stage::PROMPT : clip_chatterbox_stage::SPEECH_EMBD;
+        params.chatterbox.reference = prompt && inp->speaker_ref ? &reference : nullptr;
+        params.chatterbox.n_tokens = (int) tokens.size();
+        params.chatterbox.code = inp->code0;
+        params.chatterbox.position = inp->position;
+        params.codes = &tokens;
+        params.out_feats = &ctx->gen_out_embd;
+        if (!clip_encode(ctx_clip, &params)) { return 1; }
+        out->embd = ctx->gen_out_embd.data();
+        out->n_embd = ctx->gen_out_embd.size();
+        if (prompt) {
+            ctx->gen_out_state = inp->speaker_ref ? reference.serialize() : std::vector<uint8_t>();
+            out->state_data = reinterpret_cast<const char *>(ctx->gen_out_state.data());
+            out->state_size = ctx->gen_out_state.size();
+        }
+        return 0;
+    }
+    if (inp->type == MTMD_GEN_PROCESS_TYPE_GEN_PROMPT) {
+        LOG_ERR("%s: prompt generation is not supported by this model\n", __func__);
+        return 1;
+    }
 
     if (inp->type == MTMD_GEN_PROCESS_TYPE_GEN_CODE) {
         const size_t n_embd = (size_t) clip_n_mmproj_embd(ctx_clip);
@@ -1968,6 +2049,7 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, const mtmd_gen_in
         ctx->gen_out_feats = std::move(out_feats);
 
         out->embd      = ctx->gen_out_embd.data();
+        out->n_embd    = ctx->gen_out_embd.size();
         out->codes     = ctx->gen_out_codes.data();
         out->n_codes   = ctx->gen_out_codes.size();
         out->feats     = ctx->gen_out_feats.data();
@@ -2199,6 +2281,7 @@ bool mtmd_support_audio(const mtmd_context * ctx) {
 
 int mtmd_get_audio_sample_rate(const mtmd_context * ctx) {
     if (!ctx->ctx_a) {
+        if (ctx->ctx_gen_a && clip_get_projector_type(ctx->ctx_gen_a) == PROJECTOR_TYPE_CHATTERBOX_GEN) { return 24000; }
         return -1;
     }
     return clip_get_hparams(ctx->ctx_a)->audio_sample_rate;

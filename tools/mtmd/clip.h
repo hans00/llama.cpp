@@ -92,6 +92,30 @@ enum clip_gen_process_type {
     CLIP_GEN_PROCESS_GEN_CODE, // h_state to codes
     CLIP_GEN_PROCESS_GEN_WAV,  // codes to raw PCM audio
 };
+struct clip_chatterbox_reference {
+    std::vector<int32_t> t3_codes, decoder_codes;
+    std::vector<float> speaker, embedding, decoder_mel;
+    std::vector<uint8_t> serialize() const;
+    bool deserialize(const std::vector<uint8_t> & bytes);
+};
+bool clip_chatterbox_encode_reference(clip_ctx * ctx, const std::vector<float> & pcm, int n_threads,
+        clip_chatterbox_reference & out);
+enum class clip_chatterbox_stage {
+    DECODE, ENCODE, DENOISE, VOCODE, PROMPT, SPEECH_EMBD, DENOISE_UNCOND, EULER_STEP,
+    VOICE_ENCODER, TOKENIZE, CAMPPLUS,
+};
+struct clip_chatterbox_params {
+    clip_chatterbox_stage stage = clip_chatterbox_stage::DECODE;
+    const clip_chatterbox_reference * reference = nullptr;
+    int n_tokens = 0;
+    int code = 0, position = 0, layer = 0;
+    float time_t = 0, time_r = 1;
+    const std::vector<float> * velocity = nullptr;
+    const std::vector<float> * unconditional = nullptr;
+    const std::vector<float> * mu = nullptr;
+    const std::vector<float> * phase = nullptr;
+    const std::vector<float> * noise = nullptr;
+};
 struct clip_encode_params {
     int n_threads = 1;
     const clip_image_f32_batch * imgs = nullptr;
@@ -109,6 +133,8 @@ struct clip_encode_params {
     uint32_t seed = UINT32_MAX;               // UINT32_MAX for random
     float   temp = 0.0f;                      // sampling temperature, noise scale for flow-matching decoders
     bool * out_is_eos = nullptr;
+
+    clip_chatterbox_params chatterbox;
 
     // GEN_WAV
     const std::vector<int32_t> * codes = nullptr;     // this frame's 16 RVQ codes

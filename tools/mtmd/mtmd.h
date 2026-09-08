@@ -371,10 +371,12 @@ enum mtmd_gen_audio_type {
     MTMD_GEN_AUDIO_TYPE_NONE, // not supported
     MTMD_GEN_AUDIO_TYPE_QWEN3TTS,
     MTMD_GEN_AUDIO_TYPE_POCKETTTS,
+    MTMD_GEN_AUDIO_TYPE_CHATTERBOX,
 };
 
 struct mtmd_gen_audio_info {
     enum mtmd_gen_audio_type type;
+    bool needs_hidden_state; // backbone embeddings are consumed by GEN_CODE
     int32_t sample_rate; // in Hz, for example 24000 for qwen3tts
     const char * model_variant; // name of the weight variant, can be nullptr if not applicable
 };
@@ -387,12 +389,19 @@ enum mtmd_gen_process_type {
     MTMD_GEN_PROCESS_TYPE_GEN_WAV,  // convert semantic to PCM audio
                                     // for qwen3tts, this is code2wav
                                     // for pocket-tts, this is mimi decoder
+    MTMD_GEN_PROCESS_TYPE_GEN_PROMPT, // text token IDs and reference audio to backbone prompt embeddings
 };
 
 struct mtmd_gen_inp {
     enum mtmd_gen_process_type type;
 
+    // for MTMD_GEN_PROCESS_TYPE_GEN_PROMPT
+    const int32_t * tokens; // GEN_PROMPT: tokenized text (model-specific BOS/EOS included)
+    size_t n_tokens;
+    const struct mtmd_bitmap * speaker_ref; // optional reference for GEN_PROMPT
+
     // for MTMD_GEN_PROCESS_TYPE_GEN_CODE
+    int32_t position; // GEN_CODE: position within the generated speech sequence
     int32_t code0;  // the sampled codebook 0 entry from backbone
     float * embd;   // the hidden state from backbone, must have n_text_embd elements
     int32_t top_k;
@@ -418,8 +427,8 @@ struct mtmd_gen_out {
     size_t          n_codes;
     const float * feats; // continuous counterpart of codes
     size_t        n_feats;
-    const float * embd; // the generated hidden state, to be fed back to backbone
-                        // it must have n_text_embd elements
+    const float * embd; // prompt or next-token embeddings to feed to the backbone
+    size_t n_embd; // number of floats in embd; GEN_PROMPT can return multiple rows
     bool is_eos; // only set by pipelines having the EOS head inside mmproj
 
     // for MTMD_GEN_PROCESS_TYPE_GEN_WAV

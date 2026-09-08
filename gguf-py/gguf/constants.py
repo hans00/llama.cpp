@@ -5767,6 +5767,7 @@ class GGUFValueType(IntEnum):
 
 
 class VisionProjectorType:
+    CHATTERBOX_GEN = "chatterbox_gen"
     GEMMA3 = "gemma3"
     GEMMA3NV = "gemma3nv"
     GEMMA3NA = "gemma3na"

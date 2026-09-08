@@ -1,3 +1,6 @@
+#include <numeric>
+#include <limits>
+#include <stdexcept>
 #include "mtmd-audio.h"
 
 #define _USE_MATH_DEFINES // for M_PI
@@ -1553,5 +1556,197 @@ bool mtmd_audio_preprocessor_pockettts::preprocess(const float *                
     std::copy(samples, samples + n_samples, out.data.begin());
 
     output.push_back(std::move(out));
+    return true;
+}
+
+// Frontends used by Chatterbox's three reference encoders. All learned
+// projections run in ggml; these routines only resample and compute spectra.
+static std::vector<float> chatterbox_resample_16k(const std::vector<float> & audio) {
+    // torchaudio's default Hann-windowed sinc, reduced ratio 3:2.
+    constexpr int width = 10, kernel_size = 23;
+    constexpr double base = 2 * 0.99;
+    float kernel[2][kernel_size];
+    for (int phase = 0; phase < 2; ++phase) {
+        for (int j = 0; j < kernel_size; ++j) {
+            double t = (-phase / 2.0 + (j - width) / 3.0) * base;
+            t = std::max(-6.0, std::min(6.0, t));
+            const double window = std::pow(std::cos(t * M_PI / 12), 2);
+            const double x = t * M_PI;
+            kernel[phase][j] = (float) ((x == 0 ? 1 : std::sin(x) / x) * window * base / 3);
+        }
+    }
+    std::vector<float> out((audio.size() * 2 + 2) / 3);
+    for (size_t i = 0; i < out.size(); ++i) {
+        const int64_t start = (int64_t) (i / 2) * 3 - width;
+        float v = 0;
+        for (int j = 0; j < kernel_size; ++j) {
+            const int64_t index = start + j;
+            if (index >= 0 && index < (int64_t) audio.size()) { v += audio[index] * kernel[i % 2][j]; }
+        }
+        out[i] = v;
+    }
+    return out;
+}
+
+static mtmd_audio_mel chatterbox_spectrum(const std::vector<float> & audio, int sample_rate,
+        int n_fft, int window, int hop, int pad, int n_mels, float fmax,
+        bool kaldi, bool magnitude, const std::vector<float> * filters = nullptr) {
+    mtmd_audio_cache cache;
+    cache.fill_sin_cos_table(n_fft);
+    cache.fill_hann_window(window, !kaldi);
+    if (kaldi) { for (float & v : cache.hann_window) { v = std::pow(v, 0.85f); } }
+    cache.fill_mel_filterbank_matrix(n_mels, n_fft, sample_rate,
+        kaldi ? 20 : 0, fmax, !kaldi, 1, kaldi);
+    if (kaldi) {
+        const double low = 1127 * std::log1p(20.0 / 700);
+        const double high = 1127 * std::log1p(fmax / 700);
+        const double step = (high - low) / (n_mels + 1);
+        for (int m = 0; m < n_mels; ++m) {
+            for (int k = 0; k <= n_fft / 2; ++k) {
+                const double mel = 1127 * std::log1p((double) k * sample_rate / n_fft / 700);
+                const double left = low + m * step;
+                cache.filters.data[(size_t) m * (n_fft / 2 + 1) + k] = (float) std::max(0.0, std::min((mel - left) / step, (left + 2 * step - mel) / step));
+            }
+        }
+    }
+    const auto & bank = filters ? *filters : cache.filters.data;
+    const int frames = 1 + ((int) audio.size() + 2 * pad - window) / hop;
+    if (frames <= 0) { throw std::runtime_error("reference audio is too short"); }
+    mtmd_audio_mel mel{};
+    mel.n_len = mel.n_len_org = frames; mel.n_mel = n_mels;
+    mel.data.resize((size_t) frames * n_mels);
+    std::vector<float> input(2 * n_fft), output(8 * n_fft), spectrum(n_fft / 2 + 1);
+    for (int t = 0; t < frames; ++t) {
+        std::fill(input.begin(), input.end(), 0);
+        double mean = 0;
+        for (int j = 0; j < window; ++j) {
+            int index = t * hop + j - pad;
+            if (index < 0) { index = -index; }
+            if (index >= (int) audio.size()) { index = 2 * (int) audio.size() - 2 - index; }
+            input[j] = index >= 0 && index < (int) audio.size() ? audio[index] : 0;
+            mean += input[j];
+        }
+        if (kaldi) {
+            const float dc = (float) (mean / window);
+            for (int j = 0; j < window; ++j) { input[j] -= dc; }
+            for (int j = window - 1; j > 0; --j) { input[j] -= 0.97f * input[j - 1]; }
+            input[0] *= 0.03f;
+        }
+        for (int j = 0; j < window; ++j) { input[j] *= cache.hann_window[j]; }
+        fft(cache, input.data(), n_fft, output.data());
+        for (int k = 0; k <= n_fft / 2; ++k) {
+            float power = output[2 * k] * output[2 * k] + output[2 * k + 1] * output[2 * k + 1];
+            spectrum[k] = magnitude ? std::sqrt(power + 1e-9f) : power;
+        }
+        for (int m = 0; m < n_mels; ++m) {
+            double value = 0;
+            for (int k = 0; k <= n_fft / 2; ++k) { value += spectrum[k] * bank[(size_t) m * spectrum.size() + k]; }
+            if (kaldi) { value = std::log(std::max(value, (double) std::numeric_limits<float>::epsilon())); }
+            else if (magnitude) { value = std::log(std::max(value, 1e-5)); }
+            mel.data[(size_t) m * frames + t] = (float) value;
+        }
+    }
+    if (kaldi) {
+        for (int m = 0; m < n_mels; ++m) {
+            float * row = mel.data.data() + (size_t) m * frames;
+            double mean = std::accumulate(row, row + frames, 0.0) / frames;
+            for (int t = 0; t < frames; ++t) { row[t] -= (float) mean; }
+        }
+    }
+    return mel;
+}
+
+static void chatterbox_normalize_loudness(std::vector<float> & pcm) {
+    // pyloudnorm's default K weighting at 24 kHz (RBJ 4 dB / 1500 Hz shelf
+    // followed by a 38 Hz high-pass), with 400 ms blocks and 75% overlap.
+    constexpr double b[2][3] = {
+        {1.4882072262438641, -2.2484806333108724, 0.9061921336117813},
+        {0.9901252808218954, -1.9802505616437909, 0.9901252808218954},
+    };
+    constexpr double a[2][3] = {
+        {1, -1.3917702523418953, 0.5376889788866684},
+        {1, -1.9802015643872017, 0.9802995589003801},
+    };
+    std::vector<float> filtered = pcm;
+    for (int stage = 0; stage < 2; ++stage) {
+        double z1 = 0, z2 = 0;
+        for (float & sample : filtered) {
+            const double x = sample;
+            const double y = b[stage][0] * x + z1;
+            z1 = b[stage][1] * x - a[stage][1] * y + z2;
+            z2 = b[stage][2] * x - a[stage][2] * y;
+            sample = (float) y;
+        }
+    }
+    const int blocks = (int) std::nearbyint(((double) pcm.size() / 24000 - 0.4) / 0.1) + 1;
+    std::vector<double> energy, loudness;
+    double sum = 0; int count = 0;
+    for (int i = 0; i < blocks; ++i) {
+        double power = 0;
+        const size_t end = std::min<size_t>(pcm.size(), (size_t) i * 2400 + 9600);
+        for (size_t j = (size_t) i * 2400; j < end; ++j) { power += (double) filtered[j] * filtered[j]; }
+        power /= 9600;
+        const double level = -0.691 + 10 * std::log10(power);
+        energy.push_back(power); loudness.push_back(level);
+        if (level >= -70) { sum += power; ++count; }
+    }
+    if (!count || sum <= 0) { return; }
+    const double relative = -0.691 + 10 * std::log10(sum / count) - 10;
+    sum = 0; count = 0;
+    for (size_t i = 0; i < energy.size(); ++i) {
+        if (loudness[i] > -70 && loudness[i] > relative) { sum += energy[i]; ++count; }
+    }
+    if (!count || sum <= 0) { return; }
+    const double gain = std::pow(10.0, (-27 - (-0.691 + 10 * std::log10(sum / count))) / 20);
+    if (std::isfinite(gain) && gain > 0) { for (float & v : pcm) { v = (float) (v * gain); } }
+}
+
+bool mtmd_chatterbox_preprocess(const std::vector<float> & pcm, const std::vector<float> & token_filters,
+        bool turbo, mtmd_chatterbox_features & out) {
+    if (pcm.size() < 24000 || pcm.size() > 60 * 24000 || token_filters.size() != 128 * 201 ||
+            (turbo && pcm.size() <= 5 * 24000) ||
+            !std::all_of(pcm.begin(), pcm.end(), [](float x) { return std::isfinite(x); })) {
+        return false;
+    }
+    std::vector<float> normalized = pcm;
+    if (turbo) { chatterbox_normalize_loudness(normalized); }
+    auto wav16 = chatterbox_resample_16k(normalized);
+    auto token_mel = [&](size_t max_samples) {
+        std::vector<float> wav(wav16.begin(), wav16.begin() + std::min(wav16.size(), max_samples));
+        auto mel = chatterbox_spectrum(wav, 16000, 400, 400, 160, 200, 128, 8000, false, false, &token_filters);
+        // torch.stft's final centered frame is excluded by the tokenizer.
+        const int n = (int) mel.n_len - 1;
+        std::vector<float> logmel((size_t) n * 128);
+        float maximum = -INFINITY;
+        for (int m = 0; m < 128; ++m) {
+            for (int t = 0; t < n; ++t) {
+                float v = std::log10(std::max(mel.data[(size_t) m * mel.n_len + t], 1e-10f));
+                logmel[(size_t) m * n + t] = v;
+                maximum = std::max(maximum, v);
+            }
+        }
+        for (float & v : logmel) { v = (std::max(v, maximum - 8) + 4) / 4; }
+        mel.n_len = mel.n_len_org = n; mel.data = std::move(logmel);
+        return mel;
+    };
+    out.t3_tokens = token_mel((turbo ? 15 : 6) * 16000);
+    out.decoder_tokens = token_mel(10 * 16000);
+    std::vector<float> decoder24(normalized.begin(), normalized.begin() + std::min<size_t>(normalized.size(), 10 * 24000));
+    std::vector<float> decoder16(wav16.begin(), wav16.begin() + std::min<size_t>(wav16.size(), 10 * 16000));
+    out.decoder_mel = chatterbox_spectrum(decoder24, 24000, 1920, 1920, 480, 720, 80, 8000, false, true);
+    out.camp = chatterbox_spectrum(decoder16, 16000, 512, 400, 160, 0, 80, 8000, true, false);
+    auto ve = chatterbox_spectrum(wav16, 16000, 400, 400, 160, 200, 40, 8000, false, false);
+    const int span = std::max((int) ve.n_len - 80, 0);
+    out.n_partials = span / 80;
+    if (out.n_partials == 0 || (span % 80 + 80) / 160.0f >= 0.8f) { ++out.n_partials; }
+    out.partials.assign((size_t) 40 * out.n_partials * 160, 0);
+    for (int t = 0; t < 160; ++t) {
+        for (int b = 0; b < out.n_partials; ++b) {
+            if (b * 80 + t >= ve.n_len) { continue; }
+            for (int m = 0; m < 40; ++m) {
+                out.partials[((size_t) t * out.n_partials + b) * 40 + m] = ve.data[(size_t) m * ve.n_len + b * 80 + t];
+            }
+        }
+    }
     return true;
 }

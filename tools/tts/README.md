@@ -57,3 +57,34 @@ The [upstream repository](https://huggingface.co/kyutai/pocket-tts) holds one co
 python convert_hf_to_gguf.py path/to/pocket-tts/languages/english --outfile pocket-tts.gguf
 python convert_hf_to_gguf.py path/to/pocket-tts/languages/english --mmproj --outfile mmproj-pocket-tts.gguf
 ```
+
+## Chatterbox
+
+Supports Chatterbox, Chatterbox Multilingual (V2/V3), and Chatterbox Turbo.
+
+Available params:
+- `--tts-lang` selects the language for Multilingual: `ar`, `da`, `de`, `el`, `en`, `es`, `fi`, `fr`, `he`, `hi`, `it`, `ja`, `ko`, `ms`, `nl`, `no`, `pl`, `pt`, `ru`, `sv`, `sw`, `tr`, `zh` (default: `en`). Chatterbox and Turbo use English
+- `--tts-speaker-file` accepts reference audio (1-60 seconds; Turbo requires more than 5 seconds). Omit it to use the built-in voice
+
+Example usage:
+
+```sh
+llama-tts -m chatterbox.gguf \
+    -mm mmproj-chatterbox.gguf \
+    -p "Hello world" \
+    --tts-speaker-file speaker.wav \
+    --output out.wav
+```
+
+Sampling defaults are read from the GGUF for each variant.
+
+**Note for GGUF conversion:**
+
+Convert a directory containing one T3 checkpoint and its matching tokenizer, S3Gen, VoiceEncoder, and `conds.pt` files. For Multilingual, include `Cangjie5_TC.json` and keep V2 and V3 in separate directories.
+
+```sh
+python convert_hf_to_gguf.py path/to/chatterbox --outtype f16 --outfile chatterbox.gguf
+python convert_hf_to_gguf.py path/to/chatterbox --mmproj --outtype f16 --outfile mmproj-chatterbox.gguf
+```
+
+Optional Python text frontends (Japanese kanji readings, Hebrew diacritics, Russian stress, and Chinese word segmentation) are not included; Japanese input should use kana.

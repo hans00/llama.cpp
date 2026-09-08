@@ -2,6 +2,7 @@
 #include "clip-impl.h"
 #include "clip-model.h"
 #include "clip-graph.h"
+#include "mtmd-audio.h"
 #include "models/models.h"
 
 #include "ggml.h"
@@ -1101,6 +1102,11 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_pockettts_spkenc>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_CHATTERBOX_GEN:
+            {
+                builder = std::make_unique<clip_graph_chatterbox_gen>(ctx, img,
+                    params ? params->chatterbox : clip_chatterbox_params{clip_chatterbox_stage::ENCODE, nullptr, 1});
+            } break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             {
                 const auto gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
@@ -1831,6 +1837,12 @@ struct clip_model_loader {
                         hparams.audio_window_len  = 1024;
                         hparams.audio_hop_len     = 256;
                     } break;
+                case PROJECTOR_TYPE_CHATTERBOX_GEN:
+                    {
+                        hparams.audio_sample_rate = 24000;
+                        get_bool("clip.chatterbox.meanflow", hparams.chatterbox_meanflow);
+                        get_u32("clip.chatterbox.text_vocab_size", hparams.chatterbox_text_vocab);
+                    } break;
                 case PROJECTOR_TYPE_QWEN3TTS_GEN:
                     {
                         // TODO: hardcoded for now, read from code_predictor_config instead
@@ -1851,7 +1863,7 @@ struct clip_model_loader {
                         hparams.wav_tfm_swa = 72;
                     } break;
                 case PROJECTOR_TYPE_POCKETTTS_SPKENC:
-                case PROJECTOR_TYPE_POCKETTTS_GEN:
+            case PROJECTOR_TYPE_POCKETTTS_GEN:
                     {
                         // mimi front-end takes the raw waveform, no mel
                         hparams.audio_sample_rate = 24000;
@@ -2239,6 +2251,7 @@ struct clip_model_loader {
         const bool has_standard_layers = (
             model.proj_type != PROJECTOR_TYPE_GEMMA3NV &&
             model.proj_type != PROJECTOR_TYPE_QWEN3TTS_SPKENC &&
+            model.proj_type != PROJECTOR_TYPE_CHATTERBOX_GEN &&
             model.proj_type != PROJECTOR_TYPE_POCKETTTS_GEN);
 
         // layers
@@ -2956,6 +2969,21 @@ struct clip_model_loader {
                     load_seanet(model.seanet, false);
                     model.downsample_w = get_tensor(string_format(TN_A_DOWNSAMPLE_CONV, "weight"));
                     model.spk_proj_w   = get_tensor(string_format(TN_A_SPEAKER_PROJ, "weight"));
+                } break;
+                case PROJECTOR_TYPE_CHATTERBOX_GEN:
+                {
+                    for (const auto & item : tensor_offset) {
+                        if (item.first.rfind("a.gen.wav.", 0) == 0) {
+                            model.chatterbox_weights[item.first] = get_tensor(item.first);
+                        }
+                    }
+                    model.chatterbox_token_filters = get_vector("a.gen.wav.ref.tok._mel_filters");
+                    for (float code : get_vector("a.gen.wav.cond.prompt_token")) {
+                        if (code < 0 || code >= 6561 || code != std::floor(code)) {
+                            throw std::runtime_error("invalid Chatterbox prompt code");
+                        }
+                        model.chatterbox_prompt_codes.push_back((int32_t) code);
+                    }
                 } break;
             case PROJECTOR_TYPE_POCKETTTS_GEN:
                 {
@@ -4356,6 +4384,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 const int hop = ctx->model.hparams.mimi_downsample * 120;
                 n_patches = img->nx() / hop;
             } break;
+        case PROJECTOR_TYPE_CHATTERBOX_GEN:
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             {
                 // one latent per call for GEN_CODE, GEN_WAV sizes its input from the caller
@@ -4413,7 +4442,173 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
     }
 }
 
+// Run the encoder once, reuse a bounded denoiser graph for every Euler step,
+// then decode only the generated mel frames. No intermediate model state is
+// kept in clip_ctx, so independent requests cannot inherit another voice.
+std::vector<uint8_t> clip_chatterbox_reference::serialize() const {
+    const uint32_t header[] = {0x31584243, (uint32_t) decoder_codes.size(), (uint32_t) decoder_mel.size()};
+    std::vector<uint8_t> bytes(sizeof(header) + decoder_codes.size() * sizeof(int32_t) +
+        (decoder_mel.size() + embedding.size()) * sizeof(float));
+    size_t offset = 0;
+    auto put = [&](const void * data, size_t length) { std::memcpy(bytes.data() + offset, data, length); offset += length; };
+    put(header, sizeof(header));
+    put(decoder_codes.data(), decoder_codes.size() * sizeof(int32_t));
+    put(decoder_mel.data(), decoder_mel.size() * sizeof(float));
+    put(embedding.data(), embedding.size() * sizeof(float));
+    return bytes;
+}
+
+bool clip_chatterbox_reference::deserialize(const std::vector<uint8_t> & bytes) {
+    uint32_t header[3];
+    if (bytes.size() < sizeof(header)) { return false; }
+    std::memcpy(header, bytes.data(), sizeof(header));
+    const size_t n_codes = header[1], n_mel = header[2];
+    if (header[0] != 0x31584243 || n_codes == 0 || n_codes > 250 || n_mel != n_codes * 2 * 80 ||
+            bytes.size() != sizeof(header) + n_codes * sizeof(int32_t) + (n_mel + 192) * sizeof(float)) { return false; }
+    size_t offset = sizeof(header);
+    auto get = [&](void * data, size_t length) { std::memcpy(data, bytes.data() + offset, length); offset += length; };
+    decoder_codes.resize(n_codes); decoder_mel.resize(n_mel); embedding.resize(192);
+    get(decoder_codes.data(), n_codes * sizeof(int32_t));
+    get(decoder_mel.data(), n_mel * sizeof(float));
+    get(embedding.data(), embedding.size() * sizeof(float));
+    return std::all_of(decoder_codes.begin(), decoder_codes.end(), [](int32_t c) { return c >= 0 && c < 6561; }) &&
+        std::all_of(decoder_mel.begin(), decoder_mel.end(), [](float x) { return std::isfinite(x); }) &&
+        std::all_of(embedding.begin(), embedding.end(), [](float x) { return std::isfinite(x); });
+}
+
+bool clip_chatterbox_encode_reference(clip_ctx * ctx, const std::vector<float> & pcm, int n_threads,
+        clip_chatterbox_reference & out) {
+    mtmd_chatterbox_features features;
+    if (!mtmd_chatterbox_preprocess(pcm, ctx->model.chatterbox_token_filters, ctx->model.hparams.chatterbox_meanflow, features)) {
+        LOG_ERR("%s: reference must be finite 24 kHz mono audio, 1..60 seconds (Turbo: longer than 5 seconds)\n", __func__);
+        return false;
+    }
+    clip_image_f32 dummy;
+    dummy.set_size({1, 1}, false, true); dummy.cpy_buf(std::vector<float>(1));
+    clip_image_f32_batch batch; batch.is_audio = true; batch.entries.push_back(std::move(dummy));
+    clip_encode_params p;
+    p.imgs = &batch; p.n_threads = n_threads;
+    p.chatterbox.stage = clip_chatterbox_stage::TOKENIZE; p.chatterbox.n_tokens = features.t3_tokens.n_len;
+    p.feats = &features.t3_tokens.data; p.out_codes = &out.t3_codes;
+    if (!clip_encode(ctx, &p)) { return false; }
+    p.chatterbox.n_tokens = features.decoder_tokens.n_len;
+    p.feats = &features.decoder_tokens.data; p.out_codes = &out.decoder_codes;
+    if (!clip_encode(ctx, &p)) { return false; }
+    const size_t n_codes = std::min<size_t>(out.decoder_codes.size(), features.decoder_mel.n_len / 2);
+    if (n_codes == 0) { return false; }
+    out.decoder_codes.resize(n_codes);
+    out.decoder_mel.resize(n_codes * 2 * 80);
+    // Model conditioning stores mel frames contiguously, unlike FFT output.
+    for (size_t t = 0; t < n_codes * 2; ++t) {
+        for (size_t m = 0; m < 80; ++m) { out.decoder_mel[t * 80 + m] = features.decoder_mel.data[m * features.decoder_mel.n_len + t]; }
+    }
+    p.out_codes = nullptr;
+    p.chatterbox.stage = clip_chatterbox_stage::CAMPPLUS; p.chatterbox.n_tokens = features.camp.n_len;
+    p.feats = &features.camp.data; p.out_feats = &out.embedding;
+    if (!clip_encode(ctx, &p)) { return false; }
+    std::vector<float> activations = std::move(features.partials);
+    p.chatterbox.stage = clip_chatterbox_stage::VOICE_ENCODER; p.chatterbox.n_tokens = features.n_partials;
+    p.feats = &activations; p.out_feats = &activations;
+    for (int layer = 0; layer < 3; ++layer) {
+        p.chatterbox.layer = layer;
+        if (!clip_encode(ctx, &p)) { return false; }
+    }
+    out.speaker = std::move(activations);
+    return out.speaker.size() == 256 && out.embedding.size() == 192;
+}
+
+static bool clip_chatterbox_decode(clip_ctx * ctx, clip_encode_params * params) {
+    if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV || !params->codes || !params->out_audio ||
+            params->codes->empty() || params->codes->size() > 4096) {
+        LOG_ERR("%s: Chatterbox requires 1..4096 speech codes and a waveform output\n", __func__);
+        return false;
+    }
+    clip_chatterbox_reference reference;
+    const bool has_reference = params->state_in && !params->state_in->empty();
+    if (has_reference && !reference.deserialize(*params->state_in)) {
+        LOG_ERR("%s: invalid Chatterbox reference state\n", __func__); return false;
+    }
+    std::vector<int32_t> codes = has_reference ? reference.decoder_codes : ctx->model.chatterbox_prompt_codes;
+    for (int32_t code : *params->codes) {
+        if (code < 0 || code >= 6561) {
+            LOG_ERR("%s: Chatterbox speech code out of range: %d\n", __func__, code);
+            return false;
+        }
+        codes.push_back(code);
+    }
+    const size_t frames = codes.size() * 2;
+    const auto & weights = ctx->model.chatterbox_weights;
+    const size_t prompt_frames = has_reference ? reference.decoder_mel.size() / 80 : weights.at("a.gen.wav.cond.prompt_feat")->ne[1];
+    if (prompt_frames != (has_reference ? reference.decoder_codes.size() : ctx->model.chatterbox_prompt_codes.size()) * 2) {
+        LOG_ERR("%s: Chatterbox prompt code/mel lengths disagree\n", __func__);
+        return false;
+    }
+    std::vector<float> mu, x(frames * 80), phase(9), noise((frames - prompt_frames) * 480 * 9);
+    std::mt19937_64 rng(params->seed == UINT32_MAX ? std::random_device{}() : params->seed);
+    std::normal_distribution<float> gauss;
+    std::uniform_real_distribution<float> uniform(-(float) M_PI, (float) M_PI);
+    for (float & v : x) { v = gauss(rng); }
+    for (size_t i = 1; i < phase.size(); ++i) { phase[i] = uniform(rng); }
+    for (float & v : noise) { v = gauss(rng); }
+
+    clip_encode_params step = *params;
+    step.chatterbox.reference = has_reference ? &reference : nullptr;
+    step.chatterbox.n_tokens = (int) codes.size();
+    step.chatterbox.stage = clip_chatterbox_stage::ENCODE;
+    step.codes = &codes;
+    step.out_audio = nullptr;
+    step.out_embd = nullptr;
+    step.state_in = nullptr;
+    step.state_out = nullptr;
+    step.out_feats = &mu;
+    if (!clip_encode(ctx, &step)) { return false; }
+
+    step.chatterbox.stage = clip_chatterbox_stage::DENOISE;
+    step.chatterbox.mu = &mu;
+    step.feats = &x;
+    std::vector<float> velocity, unconditional;
+    step.chatterbox.velocity = &velocity;
+    step.chatterbox.unconditional = &unconditional;
+    const bool meanflow = ctx->model.hparams.chatterbox_meanflow;
+    const int n_steps = meanflow ? 2 : 10;
+    for (int i = 0; i < n_steps; ++i) {
+        const float t = (float) i / n_steps;
+        const float r = (float) (i + 1) / n_steps;
+        step.chatterbox.time_t = meanflow ? t : 1.0f - std::cos(t * (float) M_PI * 0.5f);
+        step.chatterbox.time_r = meanflow ? r : 1.0f - std::cos(r * (float) M_PI * 0.5f);
+        step.chatterbox.stage = clip_chatterbox_stage::DENOISE;
+        step.out_feats = &velocity;
+        if (!clip_encode(ctx, &step)) { return false; }
+        if (!meanflow) {
+            step.chatterbox.stage = clip_chatterbox_stage::DENOISE_UNCOND;
+            step.out_feats = &unconditional;
+            if (!clip_encode(ctx, &step)) { return false; }
+        }
+        step.chatterbox.stage = clip_chatterbox_stage::EULER_STEP;
+        step.out_feats = &x;
+        if (!clip_encode(ctx, &step)) { return false; }
+    }
+    step.chatterbox.stage = clip_chatterbox_stage::VOCODE;
+    step.out_feats = nullptr;
+    step.out_audio = params->out_audio;
+    step.chatterbox.phase = &phase;
+    step.chatterbox.noise = &noise;
+    if (!clip_encode(ctx, &step)) { return false; }
+    auto & audio = *params->out_audio;
+    // Reference S3Gen trim_fade: 20 ms silence followed by a 20 ms cosine fade.
+    for (size_t i = 0; i < std::min<size_t>(480, audio.size()); ++i) { audio[i] = 0; }
+    for (size_t i = 480; i < std::min<size_t>(960, audio.size()); ++i) {
+        audio[i] *= 0.5f * (1.0f - std::cos((float) M_PI * (i - 480) / 480));
+    }
+    if (params->state_out) { params->state_out->clear(); }
+    return true;
+}
+
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+    if (ctx->model.proj_type == PROJECTOR_TYPE_CHATTERBOX_GEN && params->chatterbox.stage == clip_chatterbox_stage::DECODE) {
+        return clip_chatterbox_decode(ctx, params);
+    }
+
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
@@ -4470,7 +4665,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
     };
 
-    auto set_input_i32 = [&get_inp_tensor](const char * name, std::vector<int32_t> & values) {
+    auto set_input_i32 = [&get_inp_tensor](const char * name, const std::vector<int32_t> & values) {
         ggml_tensor * cur = get_inp_tensor(name);
         GGML_ASSERT(cur->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
@@ -4564,7 +4759,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
         set_input_f32("inp_raw", inp_raw);
 
-    } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV) {
+    } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV && ctx->model.proj_type != PROJECTOR_TYPE_CHATTERBOX_GEN) {
         // audio input. GEN_WAV is not here: it takes codes or feats, set in the switch below
         GGML_ASSERT(imgs.entries.size() == 1);
 
@@ -4579,6 +4774,38 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     // set input per projector
     switch (ctx->model.proj_type) {
+        case PROJECTOR_TYPE_CHATTERBOX_GEN:
+            if (params->chatterbox.stage == clip_chatterbox_stage::VOICE_ENCODER || params->chatterbox.stage == clip_chatterbox_stage::TOKENIZE || params->chatterbox.stage == clip_chatterbox_stage::CAMPPLUS) {
+                set_input_f32("inp_features", *params->feats);
+            } else if (params->chatterbox.stage == clip_chatterbox_stage::PROMPT) {
+                set_input_i32("inp_tokens", *params->codes);
+                if (params->chatterbox.reference) {
+                    set_input_f32("inp_reference_speaker", params->chatterbox.reference->speaker);
+                    set_input_i32("inp_reference_codes", params->chatterbox.reference->t3_codes);
+                }
+            } else if (params->chatterbox.stage == clip_chatterbox_stage::SPEECH_EMBD) {
+                // Code and position are scalar graph parameters.
+            } else if (params->chatterbox.stage == clip_chatterbox_stage::ENCODE) {
+                set_input_i32("a.gen.wav.flow.tokens", *params->codes);
+            } else {
+                set_input_f32("a.gen.wav.flow.noise_z", *params->feats);
+                if (params->chatterbox.stage == clip_chatterbox_stage::DENOISE || params->chatterbox.stage == clip_chatterbox_stage::DENOISE_UNCOND) {
+                    set_input_f32("a.gen.wav.flow.mu", *params->chatterbox.mu);
+                    if (params->chatterbox.reference) {
+                        set_input_f32("inp_reference_embedding", params->chatterbox.reference->embedding);
+                        set_input_f32("inp_reference_mel", params->chatterbox.reference->decoder_mel);
+                    }
+                } else if (params->chatterbox.stage == clip_chatterbox_stage::EULER_STEP) {
+                    set_input_f32("inp_velocity", *params->chatterbox.velocity);
+                    if (!hparams.chatterbox_meanflow) {
+                        set_input_f32("inp_unconditional", *params->chatterbox.unconditional);
+                    }
+                } else {
+                    set_input_f32("a.gen.wav.hift.nsf_phase", *params->chatterbox.phase);
+                    set_input_f32("a.gen.wav.hift.nsf_noise", *params->chatterbox.noise);
+                }
+            }
+            break;
         case PROJECTOR_TYPE_MUSE_GLIMMER:
             {
                 const int grid_w = pos_w;            // image_size_width  / patch_size
@@ -5821,12 +6048,14 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         ggml_backend_tensor_get(audio, out_audio.data(), 0, ggml_nbytes(audio));
 
         // drop the tail audio that comes from the code-0 rear padding
+        if (model.proj_type == PROJECTOR_TYPE_QWEN3TTS_GEN) {
         const int64_t n_codes    = params->codes ? model.gen_code_head_w->ne[2] + 1 : 0;
         const int64_t n_frames_w = hparams.wav_tfm_swa;
         const int64_t n_frames   = params->codes ? (int64_t) params->codes->size() / n_codes : n_frames_w;
         if (n_frames < n_frames_w) {
             const size_t hop = out_audio.size() / n_frames_w;
             out_audio.resize((size_t) n_frames * hop);
+        }
         }
     }
     if (params->state_out != nullptr) {
@@ -6003,6 +6232,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.gen_code_out_embd_w->ne[0];
         case PROJECTOR_TYPE_POCKETTTS_SPKENC:
             return ctx->model.spk_proj_w->ne[1];
+        case PROJECTOR_TYPE_CHATTERBOX_GEN:
+            return ctx->model.hparams.projection_dim;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             return ctx->model.gen_input_lin_w->ne[1];
         case PROJECTOR_TYPE_PARAKEET:

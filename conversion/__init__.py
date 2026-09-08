@@ -17,6 +17,8 @@ __all__ = [
 
 
 TEXT_MODEL_MAP: dict[str, str] = {
+    "ChatterboxT3Model": "chatterbox",
+    "ChatterboxTurboT3Model": "chatterbox",
     "AfmoeForCausalLM": "afmoe",
     "LagunaForCausalLM": "laguna",
     "ApertusForCausalLM": "llama",
@@ -285,6 +287,8 @@ TEXT_MODEL_MAP: dict[str, str] = {
 
 
 MMPROJ_MODEL_MAP: dict[str, str] = {
+    "ChatterboxT3Model": "chatterbox_s3",
+    "ChatterboxTurboT3Model": "chatterbox_s3",
     "AudioFlamingo3ForConditionalGeneration": "ultravox",
     "CogVLMForCausalLM": "cogvlm",
     "DeepseekOCR2ForCausalLM": "deepseek",

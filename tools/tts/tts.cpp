@@ -155,7 +155,7 @@ int main(int argc, char ** argv) {
     const int max_new = params.n_predict > 0 ? params.n_predict : 512;
     int n_frames = 0;
     llama_token sampled = sample_semantic_code();
-    const float * h_state = llama_get_embeddings_ith(lctx, -1);
+    const float * h_state = mtmd_gen_audio_get_info(mctx.get()).needs_hidden_state ? llama_get_embeddings_ith(lctx, -1) : nullptr;
 
     tts_timings timings;
     const int64_t t_gen_start_us = ggml_time_us();

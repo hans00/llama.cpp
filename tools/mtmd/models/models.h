@@ -439,3 +439,10 @@ struct clip_graph_muse_glimmer : clip_graph {
     clip_graph_muse_glimmer(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
 };
+
+struct clip_graph_chatterbox_gen : clip_graph {
+    const clip_chatterbox_params params;
+    clip_graph_chatterbox_gen(clip_ctx * ctx, const clip_image_f32 & img, const clip_chatterbox_params & params) :
+        clip_graph(ctx, img), params(params) {}
+    ggml_cgraph * build() override;
+};

@@ -194,3 +194,11 @@ struct mtmd_audio_streaming_istft {
     std::vector<float> ifft_in;
     std::vector<float> ifft_out;
 };
+
+struct mtmd_chatterbox_features {
+    mtmd_audio_mel t3_tokens, decoder_tokens, decoder_mel, camp;
+    std::vector<float> partials;
+    int n_partials = 0;
+};
+bool mtmd_chatterbox_preprocess(const std::vector<float> & pcm, const std::vector<float> & token_filters,
+        bool turbo, mtmd_chatterbox_features & out);

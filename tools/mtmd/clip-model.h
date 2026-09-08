@@ -8,6 +8,7 @@
 #include <array>
 #include <vector>
 #include <unordered_set>
+#include <map>
 #include <cstdint>
 #include <cmath>
 
@@ -47,6 +48,8 @@ enum pad_style {
 };
 
 struct clip_hparams {
+    bool chatterbox_meanflow = false;
+    int32_t chatterbox_text_vocab = 0;
     int32_t image_size = 0;
     int32_t patch_size = 0;
     int32_t n_embd = 0;
@@ -553,6 +556,9 @@ struct clip_code2wav {
 };
 
 struct clip_model {
+    std::map<std::string, ggml_tensor *> chatterbox_weights;
+    std::vector<int32_t> chatterbox_prompt_codes;
+    std::vector<float> chatterbox_token_filters;
     clip_modality modality = CLIP_MODALITY_VISION;
     projector_type proj_type = PROJECTOR_TYPE_MLP;
     clip_hparams hparams;

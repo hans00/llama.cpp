@@ -361,6 +361,15 @@ struct clip_graph_pockettts_spkenc : clip_graph {
     ggml_tensor * tfm_layer_forward(ggml_tensor * cur, const clip_layer & layer, ggml_tensor * inp_pos, ggml_tensor * kq_mask, int il) const;
 };
 
+// SNAC 24 kHz: reference PCM to codes, or codes to PCM.
+struct clip_graph_snac : clip_graph {
+    clip_graph_snac(clip_ctx * ctx, const clip_image_f32 & img, bool encode, int n_frames)
+        : clip_graph(ctx, img), encode(encode), n_frames(n_frames) {}
+    ggml_cgraph * build() override;
+    bool encode;
+    int n_frames;
+};
+
 //
 // pocket-tts generation:
 // GEN_CODE = flow-matching decoder + end-of-speech head, one latent per call

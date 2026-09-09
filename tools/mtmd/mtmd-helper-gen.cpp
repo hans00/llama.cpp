@@ -89,7 +89,7 @@ public:
     virtual int32_t step_prompt(int32_t n_batch) = 0;
     // sampled can be LLAMA_TOKEN_NULL for pipelines with no discrete backbone token,
     // those read what they need from h_state_in instead
-    // set out_stop on end-of-speech, h_state_out must be null if no frame is generated
+    // set out_stop on end-of-speech; token-only pipelines leave h_state_out null
     virtual int32_t step_gen(llama_token sampled, const float * h_state_in, const float ** h_state_out, bool * out_stop) = 0;
     virtual int32_t get_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) = 0;
 
@@ -993,10 +993,227 @@ private:
     std::vector<char> out_buf;
 };
 
+// Orpheus emits seven interleaved SNAC codes per 2048 samples.
+class orpheus_gen_audio_pipeline : public mtmd_gen_audio_pipeline {
+  public:
+    using mtmd_gen_audio_pipeline::mtmd_gen_audio_pipeline;
+
+    void reset() override {
+        if (initialized) {
+            llama_memory_seq_rm(llama_get_memory(lctx), seq_id, -1, -1);
+        }
+        initialized = false;
+        prompt.clear();
+        codes.clear();
+        out_buf.clear();
+        prompt_pos = 0;
+        pos        = 0;
+        stopped    = false;
+    }
+
+    int32_t set_input(const mtmd_helper_gen_audio_inp * inp) override {
+        reset();
+        char kind[32];
+        if (llama_model_meta_val_str(model, "llama.tts.model", kind, sizeof(kind)) <= 0 ||
+            std::string(kind) != "orpheus") {
+            LOG_ERR("Orpheus requires a backbone converted with --model-architecture OrpheusForCausalLM\n");
+            return 1;
+        }
+        for (int i = 0; i < 28682; ++i) {
+            const std::string expected = "<custom_token_" + std::to_string(i) + ">";
+            if (128256 + i >= llama_vocab_n_tokens(vocab) || expected != llama_vocab_get_text(vocab, 128256 + i)) {
+                LOG_ERR("unsupported Orpheus token layout\n");
+                return 1;
+            }
+        }
+        if (inp->out_type != MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV && inp->out_type != MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM) {
+            return 1;
+        }
+        if (!inp->prompt || !inp->prompt_len || inp->prompt_len > INT32_MAX || inp->seq_id < 0 ||
+            (uint32_t) inp->seq_id >= llama_n_seq_max(lctx)) {
+            return 1;
+        }
+        const std::string voice      = inp->voice ? inp->voice : "";
+        const std::string transcript = inp->speaker_text ? inp->speaker_text : "";
+        if (inp->speaker_ref && (transcript.empty() || !voice.empty())) {
+            LOG_ERR("Orpheus reference conditioning requires --tts-speaker-text and no --tts-voice\n");
+            return 1;
+        }
+        if (!inp->speaker_ref && !transcript.empty()) {
+            LOG_ERR("--tts-speaker-text requires --tts-speaker-file\n");
+            return 1;
+        }
+        if (voice.find_first_of("\r\n:") != std::string::npos) {
+            return 1;
+        }
+        seq_id   = inp->seq_id;
+        seed     = inp->seed;
+        out_type = inp->out_type;
+        if (inp->speaker_ref) {
+            if (!append_text(transcript)) {
+                return 1;
+            }
+            auto request        = mtmd_gen_inp_default(mctx);
+            request.type        = MTMD_GEN_PROCESS_TYPE_GEN_PROMPT;
+            request.speaker_ref = inp->speaker_ref;
+            mtmd_gen_out out{};
+            if (mtmd_gen_audio_process(mctx, &request, &out) != 0 || !out.n_codes || out.n_codes % 7) {
+                return 1;
+            }
+            for (size_t i = 0; i < out.n_codes; ++i) {
+                prompt.push_back(128266 + (i % 7) * 4096 + out.codes[i]);
+            }
+            prompt.insert(prompt.end(), { 128258, 128262 });
+        }
+        const std::string text(inp->prompt, inp->prompt_len);
+        if (!append_text(voice.empty() ? text : voice + ": " + text)) {
+            return 1;
+        }
+        if (prompt.size() + 7 >= llama_n_ctx_seq(lctx)) {
+            LOG_ERR("Orpheus reference and text exceed the context size\n");
+            return 1;
+        }
+        if (!llama_memory_seq_rm(llama_get_memory(lctx), seq_id, -1, -1)) {
+            return 1;
+        }
+        initialized = true;
+        return 0;
+    }
+
+    int32_t step_prompt(int32_t n_batch) override {
+        if (!initialized || n_batch <= 0) {
+            return -1;
+        }
+        const size_t count =
+            std::min(prompt.size() - prompt_pos, (size_t) std::min(n_batch, (int) llama_n_batch(lctx)));
+        if (count && !decode(prompt.data() + prompt_pos, count)) {
+            return -1;
+        }
+        prompt_pos += count;
+        return prompt.size() - prompt_pos;
+    }
+
+    int32_t step_gen(llama_token sampled, const float *, const float ** h_state_out, bool * out_stop) override {
+        *h_state_out = nullptr;
+        *out_stop    = false;
+        if (!initialized || prompt_pos != prompt.size()) {
+            return 1;
+        }
+        if (stopped || sampled == 128258) {
+            stopped   = true;
+            *out_stop = true;
+            if (codes.size() % 7) {
+                LOG_ERR("Orpheus ended with an incomplete SNAC frame\n");
+                return 1;
+            }
+            return 0;
+        }
+        const int32_t code = sampled - 128266 - (codes.size() % 7) * 4096;
+        if (code < 0 || code >= 4096 || codes.size() >= 7 * 1024) {
+            LOG_ERR("invalid Orpheus speech token %d at slot %zu\n", sampled, codes.size() % 7);
+            return 1;
+        }
+        if (!decode(&sampled, 1)) {
+            return 1;
+        }
+        codes.push_back(code);
+        return 0;
+    }
+
+    int32_t get_output(int32_t * rate, const char ** data, size_t * length, int64_t * samples) override {
+        if (!initialized || codes.size() < 7) {
+            return 1;
+        }
+        std::vector<int32_t> complete(codes.begin(), codes.begin() + codes.size() / 7 * 7);
+        if (codes.size() % 7) {
+            LOG_WRN("Orpheus token limit reached; dropping the incomplete final SNAC frame\n");
+        }
+        auto request    = mtmd_gen_inp_default(mctx);
+        request.type    = MTMD_GEN_PROCESS_TYPE_GEN_WAV;
+        request.codes   = complete.data();
+        request.n_codes = complete.size();
+        request.seed    = seed;
+        mtmd_gen_out out{};
+        if (mtmd_gen_audio_process(mctx, &request, &out) != 0) {
+            return 1;
+        }
+        std::vector<float> pcm(out.audio, out.audio + out.n_samples);
+        out_buf.clear();
+        if (out_type == MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV) {
+            if (!write_wav16(out_buf, pcm, info.sample_rate)) {
+                return 1;
+            }
+        } else {
+            const char * bytes = reinterpret_cast<const char *>(pcm.data());
+            out_buf.assign(bytes, bytes + pcm.size() * sizeof(float));
+        }
+        *rate    = info.sample_rate;
+        *data    = out_buf.data();
+        *length  = out_buf.size();
+        if (samples) { *samples = pcm.size(); }
+        return 0;
+    }
+
+  private:
+    bool append_text(const std::string & text) {
+        if (text.size() > INT32_MAX) {
+            return false;
+        }
+        int n = llama_tokenize(vocab, text.data(), text.size(), nullptr, 0, true, false);
+        if (n >= 0) {
+            return false;
+        }
+        std::vector<llama_token> ids(-n);
+        n = llama_tokenize(vocab, text.data(), text.size(), ids.data(), ids.size(), true, false);
+        if (n <= 0) {
+            return false;
+        }
+        prompt.push_back(128259);
+        prompt.insert(prompt.end(), ids.begin(), ids.begin() + n);
+        prompt.insert(prompt.end(), { 128009, 128260, 128261, 128257 });
+        return true;
+    }
+
+    bool decode(const llama_token * tokens, int count) {
+        if (pos + count > (int) llama_n_ctx_seq(lctx)) {
+            LOG_ERR("Orpheus context exhausted\n");
+            return false;
+        }
+        auto batch     = llama_batch_init(count, 0, 1);
+        batch.n_tokens = count;
+        for (int i = 0; i < count; ++i) {
+            batch.token[i]     = tokens[i];
+            batch.pos[i]       = pos + i;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = seq_id;
+            batch.logits[i]    = i == count - 1;
+        }
+        const int ret = llama_decode(lctx, batch);
+        llama_batch_free(batch);
+        if (ret) {
+            return false;
+        }
+        pos += count;
+        return true;
+    }
+
+    bool                          initialized = false, stopped = false;
+    llama_seq_id                  seq_id     = 0;
+    int                           pos        = 0;
+    size_t                        prompt_pos = 0;
+    uint32_t                      seed       = UINT32_MAX;
+    std::vector<llama_token>      prompt;
+    std::vector<int32_t>          codes;
+    std::vector<char>             out_buf;
+    mtmd_helper_gen_audio_outtype out_type = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+};
+
 static std::unique_ptr<mtmd_gen_audio_pipeline> make_pipeline(llama_context * lctx, mtmd_context * mctx) {
     switch (mtmd_gen_audio_get_info(mctx).type) {
         case MTMD_GEN_AUDIO_TYPE_QWEN3TTS:
             return std::unique_ptr<mtmd_gen_audio_pipeline>(new qwen3tts_gen_audio_pipeline(lctx, mctx));
+        case MTMD_GEN_AUDIO_TYPE_SNAC:
+            return std::unique_ptr<mtmd_gen_audio_pipeline>(new orpheus_gen_audio_pipeline(lctx, mctx));
         case MTMD_GEN_AUDIO_TYPE_POCKETTTS:
             return std::unique_ptr<mtmd_gen_audio_pipeline>(new pockettts_gen_audio_pipeline(lctx, mctx));
         default:

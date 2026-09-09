@@ -201,6 +201,8 @@ struct mtmd_helper_gen_audio_inp {
 
     mtmd_bitmap * speaker_ref; // optional, can be NULL
     const char * lang; // optional, can be NULL
+    const char * voice; // Orpheus voice name, optional
+    const char * speaker_text; // transcript required for Orpheus reference conditioning
 
     int32_t  top_k;
     float    top_p;
@@ -230,7 +232,8 @@ MTMD_API int32_t mtmd_helper_gen_audio_step_prompt(
 // generates one frame; must only be called after step_prompt() has returned 0
 // sampled can be LLAMA_TOKEN_NULL for pipelines with no discrete backbone token
 // out_stop (optional) is set on end-of-speech, the caller must then stop the loop
-// h_state_out is valid until next step_gen() or reset() call, null if no frame is generated
+// h_state_out is valid until the next step_gen() or reset() call. It can be NULL
+// when no frame is generated or for token-only pipelines (needs_hidden_state == false).
 MTMD_API int32_t mtmd_helper_gen_audio_step_gen(
                         mtmd_helper_gen_audio * ctx,
                         llama_token sampled,

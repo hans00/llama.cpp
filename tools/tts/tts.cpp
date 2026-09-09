@@ -92,7 +92,8 @@ int main(int argc, char ** argv) {
         LOG_ERR("failed to load mmproj %s\n", params.mmproj.path.c_str());
         return 1;
     }
-    if (mtmd_gen_audio_get_info(mctx.get()).type == MTMD_GEN_AUDIO_TYPE_NONE) {
+    const auto gen_info = mtmd_gen_audio_get_info(mctx.get());
+    if (gen_info.type == MTMD_GEN_AUDIO_TYPE_NONE) {
         LOG_ERR("mmproj does not support audio generation\n");
         return 1;
     }
@@ -113,15 +114,17 @@ int main(int argc, char ** argv) {
 
     mtmd_helper::gen_audio gen(lctx, mctx.get());
     mtmd_helper_gen_audio_inp inp{};
-    inp.seq_id      = 0;
-    inp.prompt      = params.prompt.c_str();
-    inp.prompt_len  = params.prompt.size();
-    inp.speaker_ref = speaker_bitmap.get();
-    inp.lang        = params.tts_lang.c_str();
-    inp.top_k       = params.sampling.top_k;
-    inp.top_p       = params.sampling.top_p;
-    inp.seed        = params.sampling.seed;
-    inp.out_type    = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+    inp.seq_id       = 0;
+    inp.prompt       = params.prompt.c_str();
+    inp.prompt_len   = params.prompt.size();
+    inp.speaker_ref  = speaker_bitmap.get();
+    inp.lang         = params.tts_lang.c_str();
+    inp.voice        = params.tts_voice.c_str();
+    inp.speaker_text = params.tts_speaker_text.c_str();
+    inp.top_k        = params.sampling.top_k;
+    inp.top_p        = params.sampling.top_p;
+    inp.seed         = params.sampling.seed;
+    inp.out_type     = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
 
     //
     // stage 1: process prompt via backbone model, generate semantic representation
@@ -155,7 +158,7 @@ int main(int argc, char ** argv) {
     const int max_new = params.n_predict > 0 ? params.n_predict : 512;
     int n_frames = 0;
     llama_token sampled = sample_semantic_code();
-    const float * h_state = llama_get_embeddings_ith(lctx, -1);
+    const float * h_state = gen_info.needs_hidden_state ? llama_get_embeddings_ith(lctx, -1) : nullptr;
 
     tts_timings timings;
     const int64_t t_gen_start_us = ggml_time_us();
@@ -170,7 +173,7 @@ int main(int argc, char ** argv) {
             LOG_ERR("step_gen failed at frame %d\n", n_frames);
             return 1;
         }
-        if (!h_next) {
+        if (!h_next && (gen_info.needs_hidden_state || stop)) {
             break; // stopped without generating a frame
         }
 

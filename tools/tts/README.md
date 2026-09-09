@@ -57,3 +57,26 @@ The [upstream repository](https://huggingface.co/kyutai/pocket-tts) holds one co
 python convert_hf_to_gguf.py path/to/pocket-tts/languages/english --outfile pocket-tts.gguf
 python convert_hf_to_gguf.py path/to/pocket-tts/languages/english --mmproj --outfile mmproj-pocket-tts.gguf
 ```
+
+## Orpheus TTS
+
+Available params:
+- `--tts-voice`: `tara`, `leah`, `jess`, `leo`, `dan`, `mia`, `zac`, `zoe` for the English finetuned model
+- `--tts-speaker-file` and `--tts-speaker-text`: reference audio (up to 30 seconds) and its transcript, used together instead of `--tts-voice` for reference conditioning
+- Language and available voices depend on the backbone checkpoint
+
+Example usage:
+
+```sh
+llama-tts -m orpheus.gguf --mmproj mmproj-snac.gguf \
+    -p "Hello world" --tts-voice tara --output out.wav
+```
+
+**Note for GGUF conversion:**
+
+Convert the [Orpheus backbone](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) and [SNAC 24 kHz](https://huggingface.co/hubertsiuzdak/snac_24khz) separately:
+
+```sh
+python convert_hf_to_gguf.py path/to/orpheus --model-architecture OrpheusForCausalLM --outfile orpheus.gguf
+python convert_hf_to_gguf.py path/to/snac_24khz --mmproj --mmproj-architecture SnacModel --outfile mmproj-snac.gguf
+```

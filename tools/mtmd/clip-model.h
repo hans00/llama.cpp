@@ -553,6 +553,7 @@ struct clip_code2wav {
 };
 
 struct clip_model {
+    std::map<std::string, ggml_tensor *> snac_weights;
     clip_modality modality = CLIP_MODALITY_VISION;
     projector_type proj_type = PROJECTOR_TYPE_MLP;
     clip_hparams hparams;

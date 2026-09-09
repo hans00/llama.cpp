@@ -371,10 +371,12 @@ enum mtmd_gen_audio_type {
     MTMD_GEN_AUDIO_TYPE_NONE, // not supported
     MTMD_GEN_AUDIO_TYPE_QWEN3TTS,
     MTMD_GEN_AUDIO_TYPE_POCKETTTS,
+    MTMD_GEN_AUDIO_TYPE_SNAC,
 };
 
 struct mtmd_gen_audio_info {
     enum mtmd_gen_audio_type type;
+    bool needs_hidden_state; // false for codecs driven by backbone tokens
     int32_t sample_rate; // in Hz, for example 24000 for qwen3tts
     const char * model_variant; // name of the weight variant, can be nullptr if not applicable
 };
@@ -387,10 +389,12 @@ enum mtmd_gen_process_type {
     MTMD_GEN_PROCESS_TYPE_GEN_WAV,  // convert semantic to PCM audio
                                     // for qwen3tts, this is code2wav
                                     // for pocket-tts, this is mimi decoder
+    MTMD_GEN_PROCESS_TYPE_GEN_PROMPT, // reference PCM to conditioning codes
 };
 
 struct mtmd_gen_inp {
     enum mtmd_gen_process_type type;
+    const mtmd_bitmap * speaker_ref; // GEN_PROMPT: mono reference at the model sample rate
 
     // for MTMD_GEN_PROCESS_TYPE_GEN_CODE
     int32_t code0;  // the sampled codebook 0 entry from backbone

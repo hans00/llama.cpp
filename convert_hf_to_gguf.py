@@ -170,7 +170,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument("--model-architecture", help="override the text model architecture")
+    parser.add_argument("--mmproj-architecture", help="override the multimodal projector architecture")
     args = parser.parse_args()
+    if (args.mmproj_architecture and not args.mmproj) or (args.model_architecture and args.mmproj):
+        parser.error("use --mmproj-architecture with --mmproj, otherwise --model-architecture")
     if not args.print_supported_models and args.model is None:
         parser.error("the following arguments are required: model")
     return args
@@ -244,7 +248,8 @@ def main() -> None:
         model_type = ModelType.MMPROJ if args.mmproj else ModelType.TEXT
         hparams = ModelBase.load_hparams(dir_model, is_mistral_format)
         if not is_mistral_format:
-            model_architecture = get_model_architecture(hparams, model_type)
+            override = args.mmproj_architecture if model_type == ModelType.MMPROJ else args.model_architecture
+            model_architecture = override or get_model_architecture(hparams, model_type)
             logger.info(f"Model architecture: {model_architecture}")
             try:
                 model_class = get_model_class(model_architecture, mmproj=(model_type == ModelType.MMPROJ))

@@ -1101,6 +1101,12 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_pockettts_spkenc>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_SNAC:
+            {
+                const bool encode = params && params->gen_process == CLIP_GEN_PROCESS_GEN_CODE;
+                const int frames = !params ? 1 : encode ? (params->feats->size() + 2047) / 2048 : params->codes->size() / 7;
+                builder = std::make_unique<clip_graph_snac>(ctx, img, encode, frames);
+            } break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             {
                 const auto gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
@@ -1850,6 +1856,8 @@ struct clip_model_loader {
                         // matches the reference decoder's sliding_window (speech_tokenizer/config.json)
                         hparams.wav_tfm_swa = 72;
                     } break;
+                case PROJECTOR_TYPE_SNAC:
+                    { hparams.audio_sample_rate = 24000; } break;
                 case PROJECTOR_TYPE_POCKETTTS_SPKENC:
                 case PROJECTOR_TYPE_POCKETTTS_GEN:
                     {
@@ -2239,7 +2247,8 @@ struct clip_model_loader {
         const bool has_standard_layers = (
             model.proj_type != PROJECTOR_TYPE_GEMMA3NV &&
             model.proj_type != PROJECTOR_TYPE_QWEN3TTS_SPKENC &&
-            model.proj_type != PROJECTOR_TYPE_POCKETTTS_GEN);
+            model.proj_type != PROJECTOR_TYPE_POCKETTTS_GEN &&
+            model.proj_type != PROJECTOR_TYPE_SNAC);
 
         // layers
         const int n_layers_to_load = has_standard_layers ? hparams.n_layer : 0;
@@ -2956,6 +2965,15 @@ struct clip_model_loader {
                     load_seanet(model.seanet, false);
                     model.downsample_w = get_tensor(string_format(TN_A_DOWNSAMPLE_CONV, "weight"));
                     model.spk_proj_w   = get_tensor(string_format(TN_A_SPEAKER_PROJ, "weight"));
+                } break;
+            case PROJECTOR_TYPE_SNAC:
+                {
+                    for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
+                        std::string name = gguf_get_tensor_name(ctx_gguf.get(), i);
+                        if (name.compare(0, 10, "a.gen.wav.") == 0) {
+                            model.snac_weights[name] = get_tensor(name);
+                        }
+                    }
                 } break;
             case PROJECTOR_TYPE_POCKETTTS_GEN:
                 {
@@ -4356,6 +4374,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 const int hop = ctx->model.hparams.mimi_downsample * 120;
                 n_patches = img->nx() / hop;
             } break;
+        case PROJECTOR_TYPE_SNAC:
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             {
                 // one latent per call for GEN_CODE, GEN_WAV sizes its input from the caller
@@ -4414,6 +4433,21 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
 }
 
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+    if (ctx->model.proj_type == PROJECTOR_TYPE_SNAC) {
+        const bool encode = params->gen_process == CLIP_GEN_PROCESS_GEN_CODE;
+        if (encode) {
+            if (!params->feats || params->feats->empty() || params->feats->size() > 30 * 24000 ||
+                !std::all_of(params->feats->begin(), params->feats->end(), [](float x) { return std::isfinite(x); })) {
+                LOG_ERR("%s: SNAC requires 1 to 720000 finite reference samples\n", __func__);
+                return false;
+            }
+        } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV || !params->codes ||
+                   params->codes->empty() || params->codes->size() % 7 || params->codes->size() > 7 * 1024 ||
+                   !std::all_of(params->codes->begin(), params->codes->end(), [](int32_t c) { return c >= 0 && c < 4096; })) {
+            LOG_ERR("%s: SNAC requires complete groups of seven codes in [0, 4096)\n", __func__);
+            return false;
+        }
+    }
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
@@ -4564,7 +4598,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
         set_input_f32("inp_raw", inp_raw);
 
-    } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV) {
+    } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV && model.proj_type != PROJECTOR_TYPE_SNAC) {
         // audio input. GEN_WAV is not here: it takes codes or feats, set in the switch below
         GGML_ASSERT(imgs.entries.size() == 1);
 
@@ -4579,6 +4613,31 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     // set input per projector
     switch (ctx->model.proj_type) {
+        case PROJECTOR_TYPE_SNAC:
+            {
+                if (params->gen_process == CLIP_GEN_PROCESS_GEN_CODE) {
+                    std::vector<float> pcm = *params->feats;
+                    pcm.resize((pcm.size() + 2047) / 2048 * 2048, 0.0f);
+                    set_input_f32("inp_pcm", pcm);
+                } else {
+                    std::vector<int32_t> levels[3];
+                    const auto & codes = *params->codes;
+                    for (size_t i = 0; i < codes.size(); i += 7) {
+                        levels[0].push_back(codes[i]);
+                        for (int j : {1, 4}) { levels[1].push_back(codes[i + j]); }
+                        for (int j : {2, 3, 5, 6}) { levels[2].push_back(codes[i + j]); }
+                    }
+                    for (int i = 0; i < 3; ++i) { set_input_i32(("inp_codes_" + std::to_string(i)).c_str(), levels[i]); }
+                    std::mt19937 rng(params->seed == UINT32_MAX ? std::random_device{}() : params->seed);
+                    std::normal_distribution<float> normal(0.0f, 1.0f);
+                    for (int i = 0; i < 4; ++i) {
+                        const auto name = "inp_noise_" + std::to_string(i);
+                        std::vector<float> noise(ggml_nelements(get_inp_tensor(name.c_str())));
+                        for (auto & x : noise) { x = normal(rng); }
+                        set_input_f32(name.c_str(), noise);
+                    }
+                }
+            } break;
         case PROJECTOR_TYPE_MUSE_GLIMMER:
             {
                 const int grid_w = pos_w;            // image_size_width  / patch_size
@@ -5821,12 +5880,14 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         ggml_backend_tensor_get(audio, out_audio.data(), 0, ggml_nbytes(audio));
 
         // drop the tail audio that comes from the code-0 rear padding
-        const int64_t n_codes    = params->codes ? model.gen_code_head_w->ne[2] + 1 : 0;
-        const int64_t n_frames_w = hparams.wav_tfm_swa;
-        const int64_t n_frames   = params->codes ? (int64_t) params->codes->size() / n_codes : n_frames_w;
-        if (n_frames < n_frames_w) {
-            const size_t hop = out_audio.size() / n_frames_w;
-            out_audio.resize((size_t) n_frames * hop);
+        if (model.proj_type == PROJECTOR_TYPE_QWEN3TTS_GEN) {
+            const int64_t n_codes    = params->codes ? model.gen_code_head_w->ne[2] + 1 : 0;
+            const int64_t n_frames_w = hparams.wav_tfm_swa;
+            const int64_t n_frames   = params->codes ? (int64_t) params->codes->size() / n_codes : n_frames_w;
+            if (n_frames < n_frames_w) {
+                const size_t hop = out_audio.size() / n_frames_w;
+                out_audio.resize((size_t) n_frames * hop);
+            }
         }
     }
     if (params->state_out != nullptr) {
@@ -6003,6 +6064,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.gen_code_out_embd_w->ne[0];
         case PROJECTOR_TYPE_POCKETTTS_SPKENC:
             return ctx->model.spk_proj_w->ne[1];
+        case PROJECTOR_TYPE_SNAC:
+            return ctx->model.hparams.projection_dim;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             return ctx->model.gen_input_lin_w->ne[1];
         case PROJECTOR_TYPE_PARAKEET:

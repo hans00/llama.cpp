@@ -5812,6 +5812,7 @@ class VisionProjectorType:
     QWEN3TTS_SPKENC = "qwen3tts_spkenc" # audio: ECAPA-TDNN speaker encoder
     QWEN3TTS_GEN = "qwen3tts_gen" # audio generation: code_predictor
     POCKETTTS_SPKENC = "pockettts_spkenc" # audio: mimi encoder as voice-prompt encoder
+    SNAC = "snac" # audio generation: SNAC 24 kHz encoder and decoder
     POCKETTTS_GEN = "pockettts_gen" # audio generation: flow-matching decoder + mimi decoder
     HUNYUANVL      = "hunyuanvl"
     PARAKEET       = "parakeet"  # audio

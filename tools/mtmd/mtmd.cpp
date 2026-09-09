@@ -583,7 +583,7 @@ struct mtmd_context {
         ctx_v = res.ctx_v;
         ctx_a = res.ctx_a;
         ctx_gen_a = res.ctx_gen_a;
-        if (!ctx_v && !ctx_a) {
+        if (!ctx_v && !ctx_a && !ctx_gen_a) {
             throw std::runtime_error(string_format("Failed to load CLIP model from %s\n", mmproj_fname));
         }
 
@@ -600,7 +600,7 @@ struct mtmd_context {
 
         // since we already validate n_embd of vision and audio mmproj,
         // we can safely assume that they are the same
-        int n_embd_clip = clip_n_mmproj_embd(ctx_v ? ctx_v : ctx_a);
+        int n_embd_clip = clip_n_mmproj_embd(ctx_v ? ctx_v : (ctx_a ? ctx_a : ctx_gen_a));
         if (n_embd_text > 0 && n_embd_text != n_embd_clip) {
             throw std::runtime_error(string_format(
                 "mismatch between text model (n_embd = %d) and mmproj (n_embd = %d)\n"
@@ -1871,6 +1871,7 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
 mtmd_gen_audio_info mtmd_gen_audio_get_info(const mtmd_context * ctx) {
     mtmd_gen_audio_info info{};
     info.model_variant = "";
+    info.needs_hidden_state = true;
     if (!ctx->ctx_gen_a) {
         info.type = MTMD_GEN_AUDIO_TYPE_NONE;
         return info;
@@ -1880,6 +1881,11 @@ mtmd_gen_audio_info mtmd_gen_audio_get_info(const mtmd_context * ctx) {
         case PROJECTOR_TYPE_QWEN3TTS_GEN:
             info.type = MTMD_GEN_AUDIO_TYPE_QWEN3TTS;
             info.sample_rate = 24000;
+            break;
+        case PROJECTOR_TYPE_SNAC:
+            info.type = MTMD_GEN_AUDIO_TYPE_SNAC;
+            info.sample_rate = 24000;
+            info.needs_hidden_state = false;
             break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             info.type = MTMD_GEN_AUDIO_TYPE_POCKETTTS;
@@ -1927,6 +1933,42 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, const mtmd_gen_in
     }
 
     *out = {};
+    if (inp->type != MTMD_GEN_PROCESS_TYPE_GEN_CODE && inp->type != MTMD_GEN_PROCESS_TYPE_GEN_WAV &&
+        inp->type != MTMD_GEN_PROCESS_TYPE_GEN_PROMPT) { return 1; }
+    if (clip_get_projector_type(ctx_clip) == PROJECTOR_TYPE_SNAC && inp->type == MTMD_GEN_PROCESS_TYPE_GEN_WAV &&
+        (!inp->codes || !inp->n_codes || inp->n_codes % 7 || inp->n_codes > 7 * 1024 || inp->n_feats || inp->state_size)) {
+        LOG_ERR("%s: SNAC requires 1 to 1024 complete code groups and no decoder state\n", __func__);
+        return 1;
+    }
+    if (clip_get_projector_type(ctx_clip) == PROJECTOR_TYPE_SNAC && inp->type == MTMD_GEN_PROCESS_TYPE_GEN_CODE) {
+        return 1;
+    }
+    if (inp->type == MTMD_GEN_PROCESS_TYPE_GEN_PROMPT) {
+        const auto * bitmap = inp->speaker_ref;
+        if (clip_get_projector_type(ctx_clip) != PROJECTOR_TYPE_SNAC || !bitmap || !bitmap->is_audio ||
+            bitmap->nx < 1 || bitmap->nx > 720000 || bitmap->get_ro_buf().size() != (size_t) bitmap->nx * sizeof(float)) {
+            LOG_ERR("%s: SNAC reference must contain at most 30 seconds of mono PCM\n", __func__);
+            return 1;
+        }
+        std::vector<float> pcm(bitmap->nx);
+        std::memcpy(pcm.data(), bitmap->get_ro_buf().data(), bitmap->get_ro_buf().size());
+        clip_image_f32 dummy;
+        dummy.set_size({1, 1}, false, true);
+        dummy.cpy_buf(std::vector<float>(1));
+        clip_image_f32_batch batch;
+        batch.is_audio = true;
+        batch.entries.push_back(std::move(dummy));
+        clip_encode_params params;
+        params.imgs = &batch;
+        params.n_threads = ctx->n_threads;
+        params.gen_process = CLIP_GEN_PROCESS_GEN_CODE;
+        params.feats = &pcm;
+        params.out_codes = &ctx->gen_out_codes;
+        if (!clip_encode(ctx_clip, &params)) { return 1; }
+        out->codes = ctx->gen_out_codes.data();
+        out->n_codes = ctx->gen_out_codes.size();
+        return 0;
+    }
 
     if (inp->type == MTMD_GEN_PROCESS_TYPE_GEN_CODE) {
         const size_t n_embd = (size_t) clip_n_mmproj_embd(ctx_clip);
@@ -2199,6 +2241,7 @@ bool mtmd_support_audio(const mtmd_context * ctx) {
 
 int mtmd_get_audio_sample_rate(const mtmd_context * ctx) {
     if (!ctx->ctx_a) {
+        if (ctx->ctx_gen_a) { return clip_get_hparams(ctx->ctx_gen_a)->audio_sample_rate; }
         return -1;
     }
     return clip_get_hparams(ctx->ctx_a)->audio_sample_rate;

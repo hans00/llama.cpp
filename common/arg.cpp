@@ -4463,6 +4463,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_TTS}));
 
+    add_opt(common_arg(
+        {"--tts-voice"}, "NAME", "voice name for audio generation",
+        [](common_params & params, const std::string & value) { params.tts_voice = value; }
+    ).set_examples({LLAMA_EXAMPLE_TTS}));
+    add_opt(common_arg(
+        {"--tts-speaker-text"}, "TEXT", "transcript of the reference audio (Orpheus)",
+        [](common_params & params, const std::string & value) { params.tts_speaker_text = value; }
+    ).set_examples({LLAMA_EXAMPLE_TTS}));
+
     //
     // diffusion params
     //
